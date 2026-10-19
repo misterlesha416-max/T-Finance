@@ -1,41 +1,47 @@
-name: Build IPA on: workflow_dispatch: push: branches: [main]
-jobs: build: runs-on: macos-26 steps: - uses: actions/checkout@v4
-  - name: Find project
-    id: proj
-    run: |
-      PKG=$(find . -maxdepth 1 -name "*.swiftpm" | head -1)
-      SCHEME=$(grep -A1 'iOSApplication(' "$PKG/Package.swift" | grep 'name:' | head -1 | sed 's/.*"￼".*/\1/')
-      [ -z "￼(basename "$PKG" .swiftpm)
-      echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
-      echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
-      echo "Package: $PKG | Scheme: $SCHEME"
+name: Build IPA
 
-  - name: Xcode version
-    run: xcodebuild -version
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
-  - name: List schemes
-    working-directory: ${{ steps.proj.outputs.pkg }}
-    run: xcodebuild -list
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  - name: Build
-    working-directory: ${{ steps.proj.outputs.pkg }}
-    run: |
-      xcodebuild -scheme "${{ steps.proj.outputs.scheme }}" \
-        -configuration Release \
-        -destination 'generic/platform=iOS' \
-        -derivedDataPath ../build \
-        CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-        build
+      - name: Xcode version
+        run: xcodebuild -version
 
-  - name: Package IPA
-    run: |
-      APP=$(find build/Build/Products -maxdepth 2 -name "*.app" | head -1)
-      echo "Found: $APP"
-      mkdir -p Payload
-      cp -R "$APP" Payload/
-      zip -qr T-finance.ipa Payload
+      - name: Show files
+        run: ls -la
 
-  - uses: actions/upload-artifact@v4
-    with:
-      name: T-finance-ipa
-      path: T-finance.ipa
+      - name: Build
+        run: |
+          set -e
+          PKG=$(find . -maxdepth 1 -name "*.swiftpm" | head -1)
+          echo "Package folder: $PKG"
+          cd "$PKG"
+          cat Package.swift
+          xcodebuild -list
+          SCHEME=$(xcodebuild -list -json | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('workspace') or d.get('project') or {}).get('schemes',[''])[0])")
+          echo "Scheme: $SCHEME"
+          xcodebuild -scheme "$SCHEME" -configuration Release -destination "generic/platform=iOS" -derivedDataPath ../build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP=$(find build/Build/Products -maxdepth 2 -name "*.app" | head -1)
+          echo "Found app: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qr T-finance.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-finance-ipa
+          path: T-finance.ipa
