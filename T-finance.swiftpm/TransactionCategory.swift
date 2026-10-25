@@ -37,7 +37,7 @@ extension Array where Element == CategoryEntry {
     /// величина). Если категорий 6 или меньше — группировка не нужна,
     /// показываются все как есть.
     func groupedForDisplay() -> [CategoryEntry] {
-        let sorted = sorted { $0.amount > $1.amount }
+        let sorted = sorted { $0.amount != $1.amount ? $0.amount > $1.amount : $0.icon < $1.icon }
         guard sorted.count > 6 else { return sorted }
 
         let top = Array(sorted.prefix(5))
@@ -57,7 +57,7 @@ extension Array where Element == CategoryEntry {
     /// показать в шите по тапу на капсулу "Остальное". Пустой массив, если
     /// группировка не применяется (категорий 6 или меньше).
     func otherCategoriesForDisplay() -> [CategoryEntry] {
-        let sorted = sorted { $0.amount > $1.amount }
+        let sorted = sorted { $0.amount != $1.amount ? $0.amount > $1.amount : $0.icon < $1.icon }
         guard sorted.count > 6 else { return [] }
         return Array(sorted.dropFirst(5))
     }

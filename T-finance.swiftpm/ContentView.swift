@@ -9,18 +9,81 @@ struct CardData: Codable, Identifiable {
     var imageData: Data?
     var designIndex: Int
     var numberColor: String
+    /// Цвет рамки карточки на главном экране: "#RRGGBB", "none" — без рамки,
+    /// nil — стандартный зелёный. Optional, чтобы сохранённые ранее карты
+    /// продолжали декодироваться.
+    var borderColorHex: String?
     
     init(
         number: String,
         imageData: Data? = nil,
         designIndex: Int = 0,
-        numberColor: String = "white"
+        numberColor: String = "white",
+        borderColorHex: String? = nil
     ) {
         self.id = UUID()
         self.number = number
         self.imageData = imageData
         self.designIndex = designIndex
         self.numberColor = numberColor
+        self.borderColorHex = borderColorHex
+    }
+    
+    /// nil — рамки нет; иначе цвет и толщина (стандартная — тонкая 0.5).
+    var borderStyle: (color: Color, width: CGFloat)? {
+        switch borderColorHex {
+        case nil:
+            return (Color.green, 0.5)
+        case "none":
+            return nil
+        case let hex?:
+            return (Color(hex: hex), 1.5)
+        }
+    }
+}
+
+// MARK: - Card border palette
+
+enum CardBorderPalette {
+    /// Большая палитра: 5 оттенков для каждого из 12 цветов + оттенки серого.
+    static let swatches: [String] = {
+        let hues: [CGFloat] = [0, 25, 45, 60, 100, 140, 170, 195, 220, 260, 295, 330]
+        let tones: [(s: CGFloat, b: CGFloat)] = [
+            (0.30, 1.00),
+            (0.60, 1.00),
+            (1.00, 1.00),
+            (1.00, 0.75),
+            (0.90, 0.50)
+        ]
+        
+        var result: [String] = []
+        for tone in tones {
+            for hue in hues {
+                result.append(hex(h: hue / 360, s: tone.s, b: tone.b))
+            }
+        }
+        for gray in stride(from: CGFloat(1.0), through: 0.0, by: -1.0 / 11.0) {
+            result.append(hex(h: 0, s: 0, b: gray))
+        }
+        return result
+    }()
+    
+    static func hex(h: CGFloat, s: CGFloat, b: CGFloat) -> String {
+        Color(UIColor(hue: h, saturation: s, brightness: b, alpha: 1)).hexString
+    }
+}
+
+extension Color {
+    /// "#RRGGBB" из цвета (для сохранения выбора из ColorPicker).
+    var hexString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(
+            format: "#%02X%02X%02X",
+            Int((r * 255).rounded()),
+            Int((g * 255).rounded()),
+            Int((b * 255).rounded())
+        )
     }
 }
 
@@ -933,8 +996,8 @@ struct ContentView: View {
                 style: .continuous
             )
             .stroke(
-                Color.green,
-                lineWidth: 0.5
+                card.borderStyle?.color ?? .clear,
+                lineWidth: card.borderStyle?.width ?? 0
             )
         }
     }
@@ -1549,6 +1612,15 @@ struct ContentView: View {
                     Color.white.opacity(0.08)
                 )
             
+            // MARK: Border color
+            
+            borderColorSection
+            
+            Divider()
+                .background(
+                    Color.white.opacity(0.08)
+                )
+            
             settingsRow(
                 icon: "arrow.triangle.2.circlepath",
                 title: "Перевыпустить номер"
@@ -1635,6 +1707,122 @@ struct ContentView: View {
                 }
             }
         }
+    }
+    
+    // MARK: Border color palette
+    
+    private var currentBorderHex: String? {
+        cards.indices.contains(selectedCardIndex)
+        ? cards[selectedCardIndex].borderColorHex
+        : nil
+    }
+    
+    private var customBorderColor: Binding<Color> {
+        Binding(
+            get: {
+                guard cards.indices.contains(selectedCardIndex) else { return .green }
+                return cards[selectedCardIndex].borderStyle?.color ?? .clear
+            },
+            set: { newColor in
+                setBorder(newColor.hexString)
+            }
+        )
+    }
+    
+    private func setBorder(_ hex: String?) {
+        guard cards.indices.contains(selectedCardIndex) else { return }
+        
+        withAnimation(.easeInOut(duration: 0.15)) {
+            cards[selectedCardIndex].borderColorHex = hex
+        }
+        CardStorage.saveCards(cards)
+    }
+    
+    private var borderColorSection: some View {
+        
+        VStack(alignment: .leading, spacing: 12) {
+            
+            HStack(spacing: 10) {
+                
+                Image(systemName: "rectangle.dashed")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.blue)
+                
+                Text("Цвет рамки")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.white)
+                
+                Spacer()
+                
+                // Предпросмотр: так рамка выглядит на карточке.
+                if cards.indices.contains(selectedCardIndex) {
+                    smallCard(card: cards[selectedCardIndex])
+                        .scaleEffect(1.3)
+                        .frame(width: 54, height: 33)
+                }
+            }
+            
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 26), spacing: 8)],
+                spacing: 8
+            ) {
+                
+                // Без рамки
+                Circle()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: 26, height: 26)
+                    .overlay {
+                        Image(systemName: "slash.circle")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .overlay {
+                        Circle().stroke(
+                            Color.white,
+                            lineWidth: currentBorderHex == "none" ? 2 : 0
+                        )
+                    }
+                    .onTapGesture { setBorder("none") }
+                
+                // Стандартный зелёный
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 26, height: 26)
+                    .overlay {
+                        Circle().stroke(
+                            Color.white,
+                            lineWidth: currentBorderHex == nil ? 2 : 0
+                        )
+                    }
+                    .onTapGesture { setBorder(nil) }
+                
+                ForEach(CardBorderPalette.swatches, id: \.self) { hex in
+                    Circle()
+                        .fill(Color(hex: hex))
+                        .frame(width: 26, height: 26)
+                        .overlay {
+                            Circle().stroke(
+                                Color.white.opacity(0.25),
+                                lineWidth: 0.5
+                            )
+                        }
+                        .overlay {
+                            Circle().stroke(
+                                Color.white,
+                                lineWidth: currentBorderHex?.uppercased() == hex.uppercased() ? 2 : 0
+                            )
+                        }
+                        .onTapGesture { setBorder(hex) }
+                }
+                
+                // Любой цвет — системная палитра
+                ColorPicker("", selection: customBorderColor, supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(width: 26, height: 26)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
     
     // MARK: Number color button

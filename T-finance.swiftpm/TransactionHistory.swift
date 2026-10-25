@@ -20,6 +20,9 @@ struct Transaction: Identifiable, Codable, Equatable {
     var categoryName: String
     var amount: Double
     var date: Date
+    /// Название магазина/организации, которое вписал пользователь (см.
+    /// MerchantStore). Optional — старые операции без названия декодируются.
+    var merchantName: String?
     
     init(
         id: UUID = UUID(),
@@ -27,7 +30,8 @@ struct Transaction: Identifiable, Codable, Equatable {
         categoryIcon: String,
         categoryName: String,
         amount: Double,
-        date: Date
+        date: Date,
+        merchantName: String? = nil
     ) {
         self.id = id
         self.type = type
@@ -35,6 +39,7 @@ struct Transaction: Identifiable, Codable, Equatable {
         self.categoryName = categoryName
         self.amount = amount
         self.date = date
+        self.merchantName = merchantName
     }
     
     /// Цвет категории не хранится — как и в CategoryEntry, он однозначно
@@ -77,9 +82,18 @@ enum TransactionStore {
                 .amount += transaction.amount
         }
         
-        return byIcon.map { icon, value in
-            CategoryEntry(name: value.name, amount: value.amount, icon: icon, color: value.color)
-        }
+        // Порядок словаря случайный и меняется от вызова к вызову — при
+        // равных суммах категории «прыгали» местами на каждом обновлении
+        // экрана. Фиксируем порядок: сумма по убыванию, затем иконка.
+        return byIcon
+            .sorted { lhs, rhs in
+                lhs.value.amount != rhs.value.amount
+                    ? lhs.value.amount > rhs.value.amount
+                    : lhs.key < rhs.key
+            }
+            .map { icon, value in
+                CategoryEntry(name: value.name, amount: value.amount, icon: icon, color: value.color)
+            }
     }
 }
 
@@ -205,10 +219,17 @@ private struct TransactionRow: View {
         return formatter.string(from: transaction.date)
     }
 
-    /// Строка как в списке операций Т-Банка: слева иконка, название и
-    /// подпись; справа сумма (доход — зелёным) и название счёта под ней.
-    var body: some View {
-        HStack(spacing: 14) {
+    /// Иконка магазина, если пользователь её загрузил; иначе — иконка категории.
+    @ViewBuilder
+    private var avatar: some View {
+        if let name = transaction.merchantName,
+           let logo = MerchantStore.logo(forName: name) {
+            Image(uiImage: logo)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 44, height: 44)
+                .clipShape(Circle())
+        } else {
             ZStack {
                 Circle()
                     .fill(transaction.categoryColor)
@@ -216,18 +237,35 @@ private struct TransactionRow: View {
                 CategoryIconImage(icon: transaction.categoryIcon)
                     .frame(width: 22, height: 22)
             }
-            .frame(width: 44, height: 44)
+        }
+    }
+
+    /// Для операции с магазином под названием — категория, как в списке
+    /// Т-Банка. Без магазина название и так равно категории.
+    private var subtitle: String? {
+        transaction.merchantName == nil ? nil : transaction.categoryName
+    }
+
+    /// Строка как в списке операций Т-Банка: слева иконка, название и
+    /// подпись; справа сумма (доход — зелёным) и название счёта под ней.
+    var body: some View {
+        HStack(spacing: 14) {
+            avatar
+                .frame(width: 44, height: 44)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(transaction.categoryName)
+                Text(transaction.merchantName ?? transaction.categoryName)
                     .font(.system(size: 17, weight: .regular))
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
-                Text(timeLabel)
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundStyle(DS.textSecondary)
-                    .lineLimit(1)
+                // Время не показываем: под названием магазина — только категория.
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundStyle(DS.textSecondary)
+                        .lineLimit(1)
+                }
             }
 
             Spacer(minLength: 8)

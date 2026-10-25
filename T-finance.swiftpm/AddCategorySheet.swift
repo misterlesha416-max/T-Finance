@@ -1,8 +1,10 @@
 import SwiftUI
+import PhotosUI
 
 struct AddCategorySheet: View {
     let isIncome: Bool
-    let onAdd: (CategoryEntry) -> Void
+    /// Второй параметр — название магазина/организации (nil, если не вписано).
+    let onAdd: (CategoryEntry, String?) -> Void
     let onClose: () -> Void
 
     private var presetList: [PresetCategory] {
@@ -13,7 +15,14 @@ struct AddCategorySheet: View {
     @State private var amountText: String = ""
     @State private var searchText: String = ""
 
-    init(isIncome: Bool = false, onAdd: @escaping (CategoryEntry) -> Void, onClose: @escaping () -> Void) {
+    // Магазин / организация
+    @State private var merchantName: String = ""
+    @State private var logoImage: UIImage?
+    @State private var logoAction: MerchantLogoAction = .keep
+    @State private var matchedMerchantID: UUID?
+    @State private var photoItem: PhotosPickerItem?
+
+    init(isIncome: Bool = false, onAdd: @escaping (CategoryEntry, String?) -> Void, onClose: @escaping () -> Void) {
         self.isIncome = isIncome
         self.onAdd = onAdd
         self.onClose = onClose
@@ -36,6 +45,7 @@ struct AddCategorySheet: View {
         VStack(spacing: 0) {
             header
             amountField
+            merchantField
             searchField
             ScrollView {
                 categoryGrid
@@ -44,6 +54,175 @@ struct AddCategorySheet: View {
         }
         .background(Color(red: 0.105, green: 0.105, blue: 0.115))
         .preferredColorScheme(.dark)
+        .onChange(of: merchantName) { _, _ in
+            applyMatchedMerchant()
+        }
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data) {
+                    let square = image.squareLogo()
+                    await MainActor.run {
+                        logoImage = square
+                        logoAction = .set(square)
+                    }
+                }
+                await MainActor.run { photoItem = nil }
+            }
+        }
+    }
+
+    // MARK: - Магазин / организация
+
+    /// Если введённое название совпало с сохранённым магазином — подставляем
+    /// его иконку и последнюю выбранную для него категорию. Иконку, которую
+    /// пользователь только что выбрал сам, не трогаем.
+    private func applyMatchedMerchant() {
+        if let match = MerchantStore.find(merchantName) {
+            guard matchedMerchantID != match.id else { return }
+            matchedMerchantID = match.id
+
+            if let preset = presetList.first(where: { $0.icon == match.categoryIcon }) {
+                selected = preset
+            }
+            if case .keep = logoAction {
+                logoImage = MerchantStore.logo(for: match)
+            }
+        } else if matchedMerchantID != nil {
+            matchedMerchantID = nil
+            if case .keep = logoAction {
+                logoImage = nil
+            }
+        }
+    }
+
+    private var merchantSuggestions: [Merchant] {
+        MerchantStore.suggestions(for: merchantName)
+    }
+
+    private var logoPreview: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Group {
+                if let logoImage {
+                    Image(uiImage: logoImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 44, height: 44)
+                        .clipShape(Circle())
+                } else {
+                    ZStack {
+                        Circle()
+                            .fill(selected.color)
+                            .frame(width: 44, height: 44)
+
+                        Image(selected.icon)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 22, height: 22)
+                    }
+                }
+            }
+
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: 16))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, Color.blue)
+                .offset(x: 4, y: 4)
+        }
+        .frame(width: 48, height: 48)
+    }
+
+    private var merchantField: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    logoPreview
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Магазин или организация")
+                        .font(.system(size: 12, weight: .light))
+                        .foregroundStyle(.secondary)
+
+                    TextField("Например, Санта", text: $merchantName)
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundStyle(.white)
+                        .autocorrectionDisabled()
+                }
+
+                if logoImage != nil {
+                    Button {
+                        logoImage = nil
+                        logoAction = .remove
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if !merchantSuggestions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(merchantSuggestions) { merchant in
+                            suggestionChip(merchant)
+                        }
+                    }
+                }
+            }
+
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 16)
+    }
+
+    private func suggestionChip(_ merchant: Merchant) -> some View {
+        Button {
+            // Сбрасываем «ручной» выбор иконки: берём сохранённую.
+            logoAction = .keep
+            matchedMerchantID = nil
+            merchantName = merchant.name
+        } label: {
+            HStack(spacing: 6) {
+                if let logo = MerchantStore.logo(for: merchant) {
+                    Image(uiImage: logo)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 20, height: 20)
+                        .clipShape(Circle())
+                }
+
+                Text(merchant.name)
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Сохраняет магазин (если название вписано) и возвращает каноничное
+    /// название — для уже известного магазина это написание, которое
+    /// было сохранено в первый раз.
+    private func commitMerchant() -> String? {
+        let trimmed = merchantName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        return MerchantStore.remember(
+            name: trimmed,
+            categoryIcon: selected.icon,
+            logo: logoAction
+        ).name
     }
 
     private var header: some View {
@@ -62,13 +241,15 @@ struct AddCategorySheet: View {
 
             Button("Готово") {
                 guard let amount = parsedAmount else { return }
+                let merchant = commitMerchant()
                 onAdd(
                     CategoryEntry(
                         name: selected.name,
                         amount: amount,
                         icon: selected.icon,
                         color: selected.color
-                    )
+                    ),
+                    merchant
                 )
             }
             .font(.system(size: 17, weight: .light))

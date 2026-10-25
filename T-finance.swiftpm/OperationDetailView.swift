@@ -1,5 +1,59 @@
 import SwiftUI
 
+/// Математика «схлопывания» шапки с кольцом при прокрутке истории вниз.
+///
+/// Один и тот же offset прокрутки (contentOffset.y) делится на две фазы:
+///   0 ... searchRange                — уезжает строка поиска (её двигает OperationsView);
+///   searchRange ... totalRange       — кольцо уменьшается и уезжает вправо-вверх,
+///                                      превращаясь в карточку «Нет трат / 3 702 ₽» с кольцом
+///                                      справа (финальный кадр — последний скрин).
+/// Все координаты — в системе детали (0 — верх OperationDetailView).
+enum RingCollapse {
+    static let searchRange: CGFloat = DS.searchHeight + 16
+    /// Сколько pt прокрутки уходит на схлопывание кольца после поиска.
+    static let scrollRange: CGFloat = 100
+    static var totalRange: CGFloat { searchRange + scrollRange }
+
+    /// Верх кольца в покое: заголовок (4 + ~57) + 20.
+    static let ringTopInset: CGFloat = 81
+    static let ringBlock: CGFloat = DS.ringDiameter + DS.ringStroke
+    static var restCenterY: CGFloat { ringTopInset + ringBlock / 2 }
+    static var pickerRestY: CGFloat { ringTopInset + ringBlock + DS.ringToControlsGap }
+    /// За сколько pt прокрутки пикер Нед/Мес/Год полностью исчезает под кольцом.
+    static let pickerFadeDistance: CGFloat = 30
+
+    // Финальная карточка
+    static let cardHeight: CGFloat = 75
+    static let cardCorner: CGFloat = 24
+    static let finalRingOuter: CGFloat = 44
+    static let finalCenterY: CGFloat = cardHeight / 2
+    /// Центр маленького кольца — на столько pt левее правого края экрана.
+    static let finalCenterInsetFromTrailing: CGFloat = 100
+
+    // Заголовок («Нет трат» / сумма) и подпись
+    static let titleScaleFinal: CGFloat = 17 / DS.detailTitleFont
+    static let titleShiftX: CGFloat = 17
+    static func titleShiftY(hasAmount: Bool) -> CGFloat { hasAmount ? 13.5 : 23.3 }
+    static let subtitleShiftX: CGFloat = 17
+    static let subtitleShiftY: CGFloat = -3
+    // Кнопка закрытия
+    static let closeShiftX: CGFloat = -16
+    static let closeShiftY: CGFloat = 18.5
+
+    static func clamp01(_ v: CGFloat) -> CGFloat { min(max(v, 0), 1) }
+    static func progress(_ offset: CGFloat) -> CGFloat { clamp01((offset - searchRange) / scrollRange) }
+    static func ease(_ t: CGFloat) -> CGFloat { let c = clamp01(t); return c * c * (3 - 2 * c) }
+    /// Текущий offset прокрутки по положению блока кольца в координатах ScrollView.
+    static func scrollOffset(minY: CGFloat) -> CGFloat { max(0, ringTopInset - minY) }
+
+    static func ringScale(_ e: CGFloat) -> CGFloat { 1 + (finalRingOuter / ringBlock - 1) * e }
+    static func ringCenterY(_ e: CGFloat) -> CGFloat { restCenterY + (finalCenterY - restCenterY) * e }
+    /// Нижняя граница «шторки», под которой прячется уезжающий вверх контент.
+    static func coverHeight(_ e: CGFloat) -> CGFloat {
+        ringCenterY(e) + ringBlock * ringScale(e) / 2 + 10
+    }
+}
+
 struct OperationDetailView: View {
     let type: OperationType
     let isExpanded: Bool
@@ -30,7 +84,16 @@ struct OperationDetailView: View {
     /// рядом с уже показанным календарным кольцом.
     let onClearCustomRange: () -> Void
     let close: () -> Void
+    /// 0 — шапка раскрыта, 1 — кольцо схлопнулось в карточку (см. RingCollapse).
+    let ringCollapse: CGFloat
+    /// Сообщает наверх offset прокрутки — по нему OperationsView сворачивает
+    /// поиск и считает ringCollapse.
+    let onScrollOffsetChange: (CGFloat) -> Void
 
+    @State private var detailScroll = ScrollPosition(edge: .top)
+    @State private var currentScrollOffset: CGFloat = 0
+    /// Увеличивается, когда кольцу нужно «нарисоваться» заново.
+    @State private var revealID = 0
     @State private var searchText = ""
     @State private var isOtherCategoriesPresented = false
     @State private var selectedYear = "2026"
@@ -45,66 +108,181 @@ struct OperationDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        GeometryReader { geo in
+            ZStack(alignment: .top) {
+                // ScrollView занимает всю высоту детали: кольцо внутри него
+                // «приколото» через visualEffect (см. pinnedRingHeader) — при
+                // прокрутке оно не уезжает, а уменьшается и смещается в
+                // карточку. История и чипы едут под ним как обычно.
+                ScrollView {
+                    VStack(spacing: 0) {
+                        pinnedRingHeader
 
-            // sectionTitle остаётся не в скролле — он завязан на
-            // heroTitleOverlay/measureFrame в OperationsView, и если
-            // прокручивать его вместе с остальным контентом, "летающий"
-            // заголовок будет отставать от реального положения этого блока.
-            sectionTitle
-                .padding(.top, 4)
+                        periodPicker
+                            .visualEffect { content, proxy in
+                                let o = max(0, RingCollapse.pickerRestY - proxy.frame(in: .scrollView).minY)
+                                return content.opacity(1 - Double(RingCollapse.clamp01(o / RingCollapse.pickerFadeDistance)))
+                            }
+                            .padding(.top, DS.ringToControlsGap)
 
-            // Кольцо, пикер периода и чипы — единственные их экземпляры на
-            // весь экран, смонтированные без всякого if/else. RingCarousel
-            // хранит свой scrollPosition в @State — если положить donutChart
-            // в разные ветки условия (например, отдельно для "нет операций"
-            // и отдельно для "есть операции"), SwiftUI видит это как два
-            // разных места в дереве и при каждом переключении между ними
-            // карусель пересоздаётся заново, а вместе с ней слетает и её
-            // прокрутка. Поэтому пустое состояние и история операций ниже
-            // кросс-фейдятся через opacity (как и everywhere else в этом
-            // файле), а не через if/else.
-            ScrollView {
-                VStack(spacing: 0) {
-                    donutChart
-                        .padding(.top, 20)
+                        categoryChips
+                            .padding(.top, DS.rowGap)
 
-                    periodPicker
-                        .padding(.top, DS.ringToControlsGap)
+                        ZStack {
+                            emptyState
+                                .frame(maxWidth: .infinity, minHeight: 280)
+                                .opacity(currentCategories.isEmpty ? 1 : 0)
+                                .allowsHitTesting(currentCategories.isEmpty)
 
-                    categoryChips
-                        .padding(.top, DS.rowGap)
-
-                    ZStack {
-                        emptyState
-                            .frame(maxWidth: .infinity, minHeight: 280)
-                            .opacity(currentCategories.isEmpty ? 1 : 0)
-                            .allowsHitTesting(currentCategories.isEmpty)
-
-                        TransactionHistorySection(
-                            transactions: currentTransactions,
-                            granularity: currentHistoryGranularity
-                        )
-                        .padding(.top, DS.rowGap)
-                        .padding(.bottom, 24)
-                        .opacity(currentCategories.isEmpty ? 0 : 1)
-                        .allowsHitTesting(!currentCategories.isEmpty)
+                            TransactionHistorySection(
+                                transactions: currentTransactions,
+                                granularity: currentHistoryGranularity
+                            )
+                            .padding(.top, DS.rowGap)
+                            .padding(.bottom, 24)
+                            .opacity(currentCategories.isEmpty ? 0 : 1)
+                            .allowsHitTesting(!currentCategories.isEmpty)
+                        }
                     }
+                    // Минимальная высота даёт прокрутку даже при пустой
+                    // истории — шапка всё равно успевает свернуться.
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: geo.size.height + RingCollapse.totalRange,
+                        alignment: .top
+                    )
                 }
+                .scrollPosition($detailScroll)
+                .scrollBounceBehavior(.always)
+                .onScrollGeometryChange(for: CGFloat.self) { scroll in
+                    scroll.contentOffset.y + scroll.contentInsets.top
+                } action: { _, offset in
+                    currentScrollOffset = max(offset, 0)
+                    onScrollOffsetChange(max(offset, 0))
+                }
+                .opacity(isExpanded ? 1 : 0)
+
+                // sectionTitle остаётся вне скролла — он завязан на
+                // heroTitleOverlay/measureFrame в OperationsView.
+                sectionTitle
+                    .padding(.top, 4)
             }
-            .opacity(isExpanded ? 1 : 0)
         }
         // Постоянно смонтировано. Появление/исчезновение всего блока — это
         // просто opacity, управляемая тем же isExpanded/withAnimation, что и
-        // переключение selectedRing в OperationsView, а не отдельная
-        // transition, завязанная на монтирование/размонтирование этого view.
+        // переключение selectedRing в OperationsView.
         .opacity(isExpanded ? 1 : 0)
+        .onChange(of: isExpanded) { _, expanded in
+            // Деталь смонтирована всегда — при каждом открытии начинаем сверху.
+            if expanded {
+                detailScroll.scrollTo(y: 0)
+                revealID += 1
+            }
+        }
+        .onChange(of: selectedPeriod) { _, _ in revealID += 1 }
+        .onChange(of: customDateRange != nil) { _, _ in revealID += 1 }
         .sheet(isPresented: $isOtherCategoriesPresented) {
             OtherCategoriesSheet(
                 categories: currentOtherCategories,
                 onClose: { isOtherCategoriesPresented = false }
             )
         }
+    }
+
+    // MARK: - Pinned ring header (кольцо → карточка при прокрутке)
+
+    private var pinnedRingHeader: some View {
+        ZStack {
+            headerCover
+            headerCard
+            ringLayer
+        }
+        .frame(height: RingCollapse.ringBlock)
+        .padding(.top, RingCollapse.ringTopInset)
+        .zIndex(1)
+    }
+
+    /// «Шторка» цвета фона: прячет историю/чипы, уезжающие вверх под кольцо.
+    private var headerCover: some View {
+        Rectangle()
+            .fill(DS.background)
+            .allowsHitTesting(false)
+            .visualEffect { content, proxy in
+                let o = RingCollapse.scrollOffset(minY: proxy.frame(in: .scrollView).minY)
+                let e = RingCollapse.ease(RingCollapse.progress(o))
+                let height = RingCollapse.coverHeight(e)
+                return content
+                    .scaleEffect(x: 1, y: height / RingCollapse.ringBlock, anchor: .top)
+                    .offset(y: o - RingCollapse.ringTopInset)
+            }
+    }
+
+    /// Фон итоговой карточки — проявляется в самом конце схлопывания.
+    private var headerCard: some View {
+        RoundedRectangle(cornerRadius: RingCollapse.cardCorner, style: .continuous)
+            .fill(DS.cardBackground)
+            .frame(height: RingCollapse.cardHeight)
+            .padding(.horizontal, DS.margin)
+            .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+            .frame(maxHeight: .infinity)
+            .allowsHitTesting(false)
+            .visualEffect { content, proxy in
+                let o = RingCollapse.scrollOffset(minY: proxy.frame(in: .scrollView).minY)
+                let t = RingCollapse.progress(o)
+                let alpha = RingCollapse.clamp01((t - 0.6) / 0.3)
+                return content
+                    .opacity(Double(alpha))
+                    .offset(y: o + (RingCollapse.finalCenterY - RingCollapse.restCenterY))
+            }
+    }
+
+    /// Карусель колец + статичное маленькое кольцо без иконок. Весь блок
+    /// масштабируется и переезжает вправо-вверх; карусель по пути гаснет,
+    /// статичное кольцо проявляется под ней.
+    private var ringLayer: some View {
+        ZStack {
+            donutChart
+                .allowsHitTesting(currentScrollOffset < 10)
+                .visualEffect { content, proxy in
+                    // Соседние кольца (и иконки) пропадают почти сразу, как
+                    // только пошла прокрутка — остаётся только выбранное.
+                    let o = RingCollapse.scrollOffset(minY: proxy.frame(in: .scrollView).minY)
+                    return content.opacity(1 - Double(RingCollapse.clamp01(o / 10)))
+                }
+
+            staticRing
+                .allowsHitTesting(false)
+                .visualEffect { content, proxy in
+                    let o = RingCollapse.scrollOffset(minY: proxy.frame(in: .scrollView).minY)
+                    return content.opacity(Double(RingCollapse.clamp01(o / 4)))
+                }
+        }
+        .frame(height: RingCollapse.ringBlock)
+        .visualEffect { content, proxy in
+            let o = RingCollapse.scrollOffset(minY: proxy.frame(in: .scrollView).minY)
+            let e = RingCollapse.ease(RingCollapse.progress(o))
+            let w = proxy.size.width
+            return content
+                .scaleEffect(RingCollapse.ringScale(e))
+                .offset(
+                    x: (w / 2 - RingCollapse.finalCenterInsetFromTrailing) * e,
+                    y: o + (RingCollapse.finalCenterY - RingCollapse.restCenterY) * e
+                )
+        }
+    }
+
+    private var staticRing: some View {
+        ZStack {
+            Circle()
+                .stroke(
+                    DS.ringTrack,
+                    style: StrokeStyle(lineWidth: DS.ringStroke, lineCap: .round)
+                )
+                .frame(width: DS.ringDiameter, height: DS.ringDiameter)
+
+            CategoryDonut(categories: currentCategories, showDetails: false)
+        }
+        .frame(height: RingCollapse.ringBlock)
     }
 
     // MARK: - Section title
@@ -135,12 +313,20 @@ struct OperationDetailView: View {
                     .foregroundStyle(.white)
                     .opacity(isExpanded && totalAmount > 0 ? 1 : 0)
                     .padding(.leading, 4)
+                    .offset(
+                        x: RingCollapse.subtitleShiftX * collapseEase,
+                        y: RingCollapse.subtitleShiftY * collapseEase
+                    )
             }
 
             Spacer(minLength: 0)
 
             closeButton
                 .opacity(isExpanded ? 1 : 0)
+                .offset(
+                    x: RingCollapse.closeShiftX * collapseEase,
+                    y: RingCollapse.closeShiftY * collapseEase
+                )
         }
         .padding(.horizontal, DS.margin)
     }
@@ -153,6 +339,8 @@ struct OperationDetailView: View {
     private var displayTitle: String {
         totalAmount > 0 ? "\(formattedAmount(totalAmount)) \(currencySymbol)" : type.title
     }
+
+    private var collapseEase: CGFloat { RingCollapse.ease(ringCollapse) }
 
     private var closeButton: some View {
         Button(action: close) {
@@ -301,7 +489,8 @@ struct OperationDetailView: View {
                 itemCount: MonthData.months.count,
                 selectedIndex: $selectedMonthIndex,
                 categoriesForIndex: categoriesForMonth,
-                onRingTap: onRingTap
+                onRingTap: onRingTap,
+                revealID: revealID
             )
                 .opacity(customDateRange == nil && selectedPeriod == .month ? 1 : 0)
                 .allowsHitTesting(customDateRange == nil && selectedPeriod == .month)
@@ -310,7 +499,8 @@ struct OperationDetailView: View {
                 itemCount: WeekData.weeks.count,
                 selectedIndex: $selectedWeekIndex,
                 categoriesForIndex: categoriesForWeek,
-                onRingTap: onRingTap
+                onRingTap: onRingTap,
+                revealID: revealID
             )
                 .opacity(customDateRange == nil && selectedPeriod == .week ? 1 : 0)
                 .allowsHitTesting(customDateRange == nil && selectedPeriod == .week)
@@ -319,7 +509,8 @@ struct OperationDetailView: View {
                 itemCount: YearData.years.count,
                 selectedIndex: $selectedYearIndex,
                 categoriesForIndex: categoriesForYear,
-                onRingTap: onRingTap
+                onRingTap: onRingTap,
+                revealID: revealID
             )
                 .opacity(customDateRange == nil && selectedPeriod == .year ? 1 : 0)
                 .allowsHitTesting(customDateRange == nil && selectedPeriod == .year)
@@ -341,7 +532,7 @@ struct OperationDetailView: View {
                         )
                         .frame(width: DS.ringDiameter, height: DS.ringDiameter)
                     
-                    CategoryDonut(categories: currentCategories, showDetails: true)
+                    CategoryDonut(categories: currentCategories, showDetails: true, revealID: revealID)
                 }
             }
             .buttonStyle(.plain)
@@ -553,7 +744,9 @@ struct FiveBarsIcon: View {
         onRingTap: {},
         onDeleteCategory: { _ in },
         onClearCustomRange: {},
-        close: {}
+        close: {},
+        ringCollapse: 0,
+        onScrollOffsetChange: { _ in }
     )
     .preferredColorScheme(.dark)
     .background(DS.background)

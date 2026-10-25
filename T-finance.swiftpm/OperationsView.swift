@@ -194,7 +194,7 @@ struct OperationsView: View {
     /// укладывается в этот период — иначе начало периода, если добавляют
     /// задним числом). Это единственное место, где рождается Transaction —
     /// дальше он сам агрегируется в свою неделю/месяц/год.
-    private func addCategory(_ entry: CategoryEntry) {
+    private func addCategory(_ entry: CategoryEntry, merchantName: String? = nil) {
         let range = effectiveDateRange
         let now = Date()
         let date = range.contains(now) ? now : range.lowerBound
@@ -204,7 +204,8 @@ struct OperationsView: View {
             categoryIcon: entry.icon,
             categoryName: entry.name,
             amount: entry.amount,
-            date: date
+            date: date,
+            merchantName: merchantName
         )
         
         withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
@@ -258,6 +259,9 @@ struct OperationsView: View {
     // высота. Фильтры при этом поднимаются вверх вместе с поиском.
 
     @State private var collapse: CGFloat = 0
+    /// Offset прокрутки внутри раскрытой детали (кольцо + история). Из него
+    /// считается и сворачивание поиска, и схлопывание кольца в карточку.
+    @State private var detailScrollOffset: CGFloat = 0
     @State private var listScroll = ScrollPosition(edge: .top)
 
     private let searchCollapseRange: CGFloat = DS.searchHeight + 16
@@ -298,6 +302,11 @@ struct OperationsView: View {
     }
 
     private var isExpanded: Bool { selectedRing != nil }
+
+    /// 0 — кольцо на месте, 1 — схлопнулось в карточку (см. RingCollapse).
+    private var ringCollapse: CGFloat {
+        isExpanded ? RingCollapse.progress(detailScrollOffset) : 0
+    }
 
     /// OperationDetailView stays permanently mounted (see rationale there),
     /// so it always needs *some* type to lay out its title placeholder with —
@@ -366,8 +375,16 @@ struct OperationsView: View {
                             },
                             close: {
                                 withAnimation(.spring(response: 0.55, dampingFraction: 0.8)) {
+                                    collapse = 0
+                                    detailScrollOffset = 0
                                     selectedRing = nil
                                 }
+                            },
+                            ringCollapse: ringCollapse,
+                            onScrollOffsetChange: { offset in
+                                guard isExpanded else { return }
+                                detailScrollOffset = offset
+                                collapse = min(max(offset, 0), searchCollapseRange)
                             }
                         )
                         .allowsHitTesting(isExpanded)
@@ -404,8 +421,8 @@ struct OperationsView: View {
         .sheet(isPresented: $isAddCategoryPresented) {
             AddCategorySheet(
                 isIncome: activeType == .income,
-                onAdd: { entry in
-                    addCategory(entry)
+                onAdd: { entry, merchantName in
+                    addCategory(entry, merchantName: merchantName)
                     isAddCategoryPresented = false
                 },
                 onClose: {
@@ -426,7 +443,11 @@ struct OperationsView: View {
         let query = searchText.trimmingCharacters(in: .whitespaces).lowercased()
         return transactions
             .filter { range.contains($0.date) }
-            .filter { query.isEmpty || $0.categoryName.lowercased().contains(query) }
+            .filter {
+                query.isEmpty
+                || $0.categoryName.lowercased().contains(query)
+                || ($0.merchantName?.lowercased().contains(query) ?? false)
+            }
             .sorted { $0.date > $1.date }
     }
 
@@ -441,8 +462,12 @@ struct OperationsView: View {
 
     private var collapsedContent: some View {
         VStack(spacing: 0) {
+            // Карточки лежат поверх списка: список не обрезается по их
+            // нижней границе, а уезжает ПОД них и выглядывает из-за
+            // скруглённых углов и из зазора между карточками.
             summaryCards
                 .offset(y: pullOffset)
+                .zIndex(1)
 
             ZStack {
                 GeometryReader { geo in
@@ -461,6 +486,7 @@ struct OperationsView: View {
                             alignment: .top
                         )
                     }
+                    .scrollClipDisabled()
                     .scrollPosition($listScroll)
                     .scrollBounceBehavior(.always)
                     .onScrollGeometryChange(for: CGFloat.self) { scroll in
@@ -482,6 +508,9 @@ struct OperationsView: View {
                 }
             }
         }
+        // Обрезаем по верхней границе карточек: прокрученный вверх контент
+        // виден под карточками, но не вылезает выше них (на чипы).
+        .clipped()
     }
 
     // MARK: - Filter chips
@@ -565,6 +594,7 @@ struct OperationsView: View {
     /// (самого нового) кольца, а не с того места, где их оставили в прошлый раз.
     private func resetPeriodIndices() {
         listScroll.scrollTo(y: 0)
+        detailScrollOffset = 0
         selectedMonthIndex = 0
         selectedWeekIndex = 0
         selectedYearIndex = 0
@@ -583,6 +613,13 @@ struct OperationsView: View {
         ZStack(alignment: .topLeading) {
             ForEach([OperationType.spending, .income]) { type in
                 let isActive = selectedRing == type
+                let e = RingCollapse.ease(ringCollapse)
+                let hasAmount = totalAmount(for: type) > 0
+                let titleScale: CGFloat = isActive
+                    ? 1 + (RingCollapse.titleScaleFinal - 1) * e
+                    : DS.cardTitleScale
+                let titleX: CGFloat = isActive ? 3 + RingCollapse.titleShiftX * e : 0
+                let titleY: CGFloat = isActive ? RingCollapse.titleShiftY(hasAmount: hasAmount) * e : 0
                 let frame = isActive
                     ? heroFrames["detailTitle"]
                     : heroFrames["card_\(type.id)"]
@@ -593,9 +630,9 @@ struct OperationsView: View {
                         .foregroundStyle(.white)
                         .fixedSize()
                         .contentTransition(.opacity)
-                        .scaleEffect(isActive ? 1 : DS.cardTitleScale, anchor: .topLeading)
+                        .scaleEffect(titleScale, anchor: .topLeading)
                         .frame(width: frame.width, height: frame.height, alignment: .topLeading)
-                      .offset(x: frame.minX + (isActive ? 3 : 0), y: frame.minY)
+                        .offset(x: frame.minX + titleX, y: frame.minY + titleY)
                         // The inactive title's card fades away with the rest
                         // of collapsedContent — hide its hero too, or it'd be
                         // left floating with no card behind it.

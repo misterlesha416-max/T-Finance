@@ -464,6 +464,9 @@ struct RingCarousel: View {
     @Binding var selectedIndex: Int
     var categoriesForIndex: (Int) -> [CategoryEntry] = { _ in [] }
     var onRingTap: () -> Void = {}
+    /// Меняется, когда кольцо нужно «нарисовать» заново (открытие детали,
+    /// смена периода) — см. CategoryDonut.revealID.
+    var revealID: Int = 0
     @State private var scrollPosition: Int?
     
     /// Ширина "слота" одной страницы — шире самого кольца, чтобы соседние
@@ -505,7 +508,8 @@ struct RingCarousel: View {
                             // проценты — только у выбранного (showDetails).
                             CategoryDonut(
                                 categories: categoriesForIndex(index),
-                                showDetails: index == selectedIndex
+                                showDetails: index == selectedIndex,
+                                revealID: revealID
                             )
                         }
                         .frame(width: itemWidth)
@@ -662,6 +666,46 @@ struct CategoryDonut: View {
     /// только для открытого/выбранного кольца.
     var showDetails: Bool = true
     
+    /// Смена значения перезапускает анимацию появления выбранного кольца.
+    var revealID: Int = 0
+    
+    // Анимация появления: дуга «рисуется» по часовой стрелке от 12 часов,
+    // после неё плавно проявляются иконки и проценты.
+    @State private var reveal: Double = 1
+    @State private var detailsOpacity: Double = 1
+    /// Свечение появляется только после того, как кольцо дорисовано.
+    @State private var glowOpacity: Double = 1
+    @State private var isRevealing = false
+    @State private var revealGeneration = 0
+    
+    private var dataSignature: String {
+        categories
+            .map { "\($0.icon):\($0.amount)" }
+            .sorted()
+            .joined(separator: ",")
+    }
+    
+    private func replay() {
+        revealGeneration += 1
+        let generation = revealGeneration
+        isRevealing = true
+        reveal = 0
+        detailsOpacity = 0
+        glowOpacity = 0
+        
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            guard generation == revealGeneration else { return }
+            withAnimation(.easeInOut(duration: 0.75)) { reveal = 1 }
+            
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard generation == revealGeneration else { return }
+            isRevealing = false
+            withAnimation(.easeOut(duration: 0.3)) { detailsOpacity = 1 }
+            withAnimation(.easeInOut(duration: 0.6)) { glowOpacity = 1 }
+        }
+    }
+    
     /// Минимальная визуальная ширина маленькой категории — раньше была
     /// захардкожена как 22°, что при DS.ringStroke = 23 и
     /// DS.ringDiameter = 120 даёт дугу примерно ТОЙ ЖЕ длины, что и
@@ -730,7 +774,7 @@ struct CategoryDonut: View {
     private var orderedCategories: [CategoryEntry] {
         var result = categories
             .filter { $0.amount > 0 }
-            .sorted { $0.amount > $1.amount }
+            .sorted { $0.amount != $1.amount ? $0.amount > $1.amount : $0.icon < $1.icon }
         
         guard result.count > 1 else {
             return result
@@ -969,6 +1013,49 @@ struct CategoryDonut: View {
     }
     
     var body: some View {
+        Group {
+            if isRevealing {
+                RevealingRing(progress: reveal) { p in
+                    ZStack {
+                        ringContent(sweep: p * 360)
+                            .mask { RevealMask(progress: p) }
+                        
+                        // Круглое начало первого сегмента: маска режет его
+                        // ровно по 12 часам, поэтому рисуем закруглённый
+                        // старт отдельно, поверх маски. В конце анимации он
+                        // заменяется настоящим стыком (верхний сегмент
+                        // «дорисовывает» свою круглую капу).
+                        if let startColor = segments.first?.category.color,
+                           p > 0.001,
+                           p * 360 < 359 {
+                            Circle()
+                                .fill(startColor)
+                                .frame(width: DS.ringStroke, height: DS.ringStroke)
+                                .offset(y: -DS.ringDiameter / 2)
+                        }
+                    }
+                }
+            } else {
+                ringContent(sweep: 360)
+            }
+        }
+        .onChange(of: showDetails) { _, shown in
+            if shown { replay() }
+        }
+        .onChange(of: revealID) { _, _ in
+            if showDetails { replay() }
+        }
+        .onChange(of: dataSignature) { _, _ in
+            if showDetails { replay() }
+        }
+    }
+    
+    /// sweep — до какого угла (0...360) уже «дорисовано» кольцо. Пока он
+    /// меньше 360, всё, что торчит за 12 часов с конца последнего сегмента
+    /// (круглая капа, её тень), скрыто — иначе конец дуги мелькал бы сверху
+    /// ещё до начала рисования.
+    @ViewBuilder
+    private func ringContent(sweep: Double) -> some View {
         
         let currentSegments: [Segment] = segments
         
@@ -988,6 +1075,12 @@ struct CategoryDonut: View {
         
         let indexedVisibleSegments =
         Array(visibleSegments.enumerated())
+        
+        // Индекс НАСТОЯЩЕГО верхнего сегмента (currentSegments.last) внутри
+        // visibleSegments: порядок там [dominant, top, ...rest], так что это 1
+        // (или 0, если доминанта нет). Именно его круглая капа торчит за
+        // 12 часов, пока кольцо ещё рисуется.
+        let topVisibleIndex = dominantSegment == nil ? 0 : 1
         
         // ВАЖНО: вся отрисовка CategoryDonut — glow включительно — должна
         // находиться внутри ОДНОГО фиксированного ZStack 120x120. Раньше
@@ -1043,12 +1136,12 @@ struct CategoryDonut: View {
                         segment.category.color,
                         style: StrokeStyle(
                             lineWidth: DS.ringStroke,
-                            lineCap: .round
+                            lineCap: (item.offset == topVisibleIndex && sweep < 359) ? .butt : .round
                         )
                     )
                     .rotationEffect(.degrees(-90))
                     .blur(radius: 12)
-                    .opacity(0.35)
+                    .opacity(0.35 * glowOpacity)
             }
             
             // MARK: - Glow одиночного сегмента
@@ -1074,7 +1167,7 @@ struct CategoryDonut: View {
                     )
                     .rotationEffect(.degrees(-90))
                     .blur(radius: 12)
-                    .opacity(0.35)
+                    .opacity(0.35 * glowOpacity)
             }
             
             let indexedCurrentSegments =
@@ -1124,6 +1217,7 @@ struct CategoryDonut: View {
                     .fill(topSegment.category.color)
                     .frame(width: DS.ringStroke, height: DS.ringStroke)
                     .shadow(color: .black.opacity(0.34), radius: capShadowRadius, x: 0, y: -2)
+                    .opacity(sweep >= 359 ? 1 : 0)
                     .offset(offset(angleDegrees: angle, radius: DS.ringDiameter / 2))
             }
             
@@ -1168,6 +1262,7 @@ struct CategoryDonut: View {
                         
                         .degrees(-90)
                     )
+                    .opacity(sweep >= 359 ? 1 : 0)
             }
             
             
@@ -1228,6 +1323,7 @@ struct CategoryDonut: View {
                         x: 2,
                         y: 2
                     )
+                    .opacity((item.offset == topVisibleIndex && sweep < 359) ? 0 : 1)
                 
                 
                 // Основная дуга
@@ -1241,7 +1337,7 @@ struct CategoryDonut: View {
                         segment.category.color,
                         style: StrokeStyle(
                             lineWidth: DS.ringStroke,
-                            lineCap: .round
+                            lineCap: (item.offset == topVisibleIndex && sweep < 359) ? .butt : .round
                         )
                     )
                     .rotationEffect(
@@ -1318,6 +1414,7 @@ struct CategoryDonut: View {
                                 width: iconSize,
                                 height: iconSize
                             )
+                            .opacity(detailsOpacity)
                         }
                     }
                     .offset(
@@ -1363,6 +1460,7 @@ struct CategoryDonut: View {
                     if showDetails {
                         CategoryIconImage(icon: dominantSegment.category.icon)
                             .frame(width: iconSize, height: iconSize)
+                            .opacity(detailsOpacity)
                     }
                 }
                 .offset(offset(angleDegrees: angle, radius: DS.ringDiameter / 2))
@@ -1395,6 +1493,7 @@ struct CategoryDonut: View {
                         .foregroundStyle(
                             DS.textSecondary
                         )
+                        .opacity(detailsOpacity)
 
                         .offset(
                             offset(
@@ -1409,6 +1508,56 @@ struct CategoryDonut: View {
             width: DS.ringDiameter,
             height: DS.ringDiameter
         )
+    }
+}
+
+/// Обёртка, которая перерисовывает содержимое на каждом кадре анимации
+/// progress (обычный state прыгнул бы сразу в конечное значение).
+private struct RevealingRing<Content: View>: View, Animatable {
+    var progress: Double
+    let content: (Double) -> Content
+    
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+    
+    var body: some View { content(progress) }
+}
+
+/// Маска «рисования» кольца: сектор от 12 часов по часовой стрелке до
+/// progress, с круглым передним краем (как у капы дуги). Animatable —
+/// чтобы progress интерполировался каждый кадр, а не прыгал в конец.
+private struct RevealMask: View, Animatable {
+    var progress: Double
+    
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+    
+    var body: some View {
+        let p = min(max(progress, 0), 1)
+        let radius = DS.ringDiameter / 2
+        let radians = p * 2 * Double.pi
+        
+        ZStack {
+            Circle()
+                .trim(from: 0, to: CGFloat(p))
+                .stroke(Color.white, style: StrokeStyle(lineWidth: 110, lineCap: .butt))
+                .rotationEffect(.degrees(-90))
+                .frame(width: DS.ringDiameter, height: DS.ringDiameter)
+            
+            Circle()
+                .fill(Color.white)
+                .frame(width: DS.ringStroke, height: DS.ringStroke)
+                .offset(
+                    x: radius * CGFloat(sin(radians)),
+                    y: -radius * CGFloat(cos(radians))
+                )
+                .opacity(p > 0.001 && p < 0.999 ? 1 : 0)
+        }
+        .frame(width: DS.ringDiameter, height: DS.ringDiameter)
     }
 }
 
